@@ -3,9 +3,12 @@
 
   Команды:
     send   -From claude|codex -To claude|codex -Topic "..." (-Body "..." | -BodyFile path)
-           [-Project path] [-ReplyTo id] [-Round n]
-    wait   -For claude|codex [-TimeoutMinutes 720]   ждать письмо, показать, убрать в архив
-    inbox  -For claude|codex                         показать непрочитанные, не трогая
+           [-Box имя] [-Project path] [-ReplyTo id] [-Round n]
+    wait   -For claude|codex [-Box имя] [-TimeoutMinutes 720]   ждать письмо, показать, убрать в архив
+    inbox  -For claude|codex [-Box имя]                         показать непрочитанные, не трогая
+
+  -Box — отделение конкретного чата Claude (по умолчанию main). Чатов Claude может быть
+  несколько, и у каждого своё отделение; ответ Codex приходит в отделение отправителя.
     status                                           настройки и проверка Codex
 
   Ящик: $env:AGENT_MAIL_HOME или ~/.agent-mail
@@ -24,6 +27,7 @@ param(
   [string]$Project,
   [string]$ReplyTo,
   [int]$Round = 1,
+  [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Box = 'main',
   [int]$TimeoutMinutes = 720
 )
 
@@ -115,14 +119,21 @@ function Read-Letter([string]$path) {
   return @{ Text = $text; Meta = $meta; Path = $path }
 }
 
+function Get-InboxDir([string]$who) {
+  if ($who -eq 'claude' -and $Box -ne 'main') { return Get-Dir "inbox\claude\$Box" }
+  return Get-Dir "inbox\$who"
+}
+
 function Get-Unread([string]$who) {
-  $dir = Get-Dir "inbox\$who"
+  $dir = Get-InboxDir $who
   return @(Get-ChildItem -Path $dir -Filter '*.md' -File | Sort-Object Name)
 }
 
 function Move-ToArchive([string]$path, [string]$state) {
   $dest = Join-Path (Get-Dir 'archive') ((Split-Path $path -Leaf) -replace '\.md$', ".$state.md")
-  Move-Item -LiteralPath $path -Destination $dest -Force
+  # Без перезаписи: [IO.File]::Move атомарен и падает, если письмо уже забрали.
+  [IO.File]::Move($path, $dest)
+  return $dest
 }
 
 function Send-Letter {
@@ -137,6 +148,7 @@ function Send-Letter {
     "id: $id"
     "from: $From"
     "to: $To"
+    "box: $Box"
     "topic: $Topic"
     "project: $Project"
     "round: $Round"
@@ -147,7 +159,7 @@ function Send-Letter {
   $letter = $header + "`n" + $Body.Trim() + "`n"
 
   # Пишем во временный файл и переименовываем, чтобы получатель не прочитал половину письма.
-  $inbox = Get-Dir "inbox\$To"
+  $inbox = Get-InboxDir $To
   $tmp = Join-Path $inbox "$id.tmp"
   $final = Join-Path $inbox "$id.md"
   [IO.File]::WriteAllText($tmp, $letter, $Utf8)
@@ -164,29 +176,36 @@ function Send-Letter {
       $Body.Trim()
       ''
       '---'
-      "Действуй по скиллу agent-mail. Ответ: mail.ps1 send -From codex -To $From -ReplyTo $id -Round $next -Topic ""..."" -BodyFile <файл>"
+      "Действуй по скиллу agent-mail. Ответ: mail.ps1 send -From codex -To $From$(if ($From -eq 'claude') { " -Box $Box" }) -ReplyTo $id -Round $next -Topic ""..."" -BodyFile <файл>"
     ) -join "`n"
     $thread = Resolve-CodexThread $cfg.codexChat
     $r = Invoke-Native $codex @('queue', '--thread', $thread, '--message', $notice)
     if ($r.Code -ne 0) { throw "Письмо $id лежит в ящике, но очередь Codex не приняла его: $($r.Out)" }
     # Успех queue значит «поставлено в очередь», а не «прочитано»: ответ проверяется отдельно.
-    Move-ToArchive $final 'queued'
+    Move-ToArchive $final 'queued' | Out-Null
     Write-Output "Поставлено в очередь: $id -> чат Codex «$($cfg.codexChat)»."
   } else {
-    Write-Output "Отправлено: $id -> ящик $To."
+    Write-Output "Отправлено: $id -> ящик $To/$Box."
   }
 }
 
 function Show-Letters([object[]]$files, [bool]$archive) {
   $cfg = Get-Config
+  $script:Shown = 0
   foreach ($f in $files) {
-    $l = Read-Letter $f.FullName
+    $path = $f.FullName
+    if ($archive) {
+      # Забираем письмо переносом в архив: перенос атомарный, и если другой ожидающий
+      # успел раньше, письмо его, а не наше.
+      try { $path = Move-ToArchive $path 'read' } catch { continue }
+    }
+    $l = Read-Letter $path
+    $script:Shown++
     Write-Output "===== ПИСЬМО $($l.Meta['id']) ====="
     Write-Output $l.Text.TrimEnd()
     if ([int]$l.Meta['round'] -ge [int]$cfg.maxRounds) {
       Write-Output "!!! Круг $($l.Meta['round']) из $($cfg.maxRounds): дальше без владельца не отвечать."
     }
-    if ($archive) { Move-ToArchive $f.FullName 'read' }
   }
 }
 
@@ -206,7 +225,8 @@ switch ($Command) {
         # Короткая пауза, чтобы забрать и письма, пришедшие пачкой.
         Start-Sleep -Seconds 2
         Show-Letters (Get-Unread $For) $true
-        exit 0
+        # Если все письма забрал другой ожидающий, ждём дальше, а не будим чат зря.
+        if ($script:Shown -gt 0) { exit 0 }
       }
       Start-Sleep -Seconds 2
     }
@@ -220,6 +240,7 @@ switch ($Command) {
     Write-Output "Лимит кругов: $($cfg.maxRounds)"
     $codex = Find-Codex
     Write-Output "codex.exe:   $(if ($codex) { $codex } else { 'НЕ НАЙДЕН' })"
-    foreach ($w in 'claude', 'codex') { Write-Output "Входящие $w`: $((Get-Unread $w).Count)" }
+    Write-Output "Входящие claude/$Box`: $((Get-Unread 'claude').Count)"
+    Write-Output "Входящие codex: $((Get-Unread 'codex').Count)"
   }
 }

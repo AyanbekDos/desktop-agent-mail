@@ -20,7 +20,7 @@ description: Почта между чатом «Почта» в Codex desktop и
 powershell -NoProfile -ExecutionPolicy Bypass -File "$HOME\.agent-mail\bin\mail.ps1" send -From codex -To claude -Topic "коротко о чём" -Project "<папка проекта>" -BodyFile <файл>
 ```
 
-3. Для ответа на письмо добавь `-ReplyTo <id> -Round <круг письма + 1>`.
+3. Для ответа на письмо добавь `-ReplyTo <id> -Round <круг письма + 1>` и `-Box <отделение>`. В конце письма есть готовая команда ответа: в ней уже стоит отделение того чата Claude, который писал. Если пишешь Claude первым, без `-Box` письмо уйдёт в главный почтовый чат (`main`).
 
 Почтовый чат Claude ждёт писем в фоне и просыпается сразу.
 
