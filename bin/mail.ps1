@@ -63,6 +63,25 @@ function Find-Codex {
   return $null
 }
 
+# codex queue не находит чат по имени, когда чатов много, поэтому ищем номер сами.
+# В session_index.jsonl переименование дописывает новую строку: актуально последнее имя.
+function Resolve-CodexThread([string]$chat) {
+  if ($chat -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { return $chat }
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+  $index = Join-Path $codexHome 'session_index.jsonl'
+  if (-not (Test-Path $index)) { throw "Не найден $index. Укажите в config.json номер чата вместо имени." }
+  $names = @{}
+  foreach ($line in [IO.File]::ReadAllLines($index, $Utf8)) {
+    if (-not $line.Trim()) { continue }
+    try { $e = $line | ConvertFrom-Json } catch { continue }
+    if ($e.id) { $names[$e.id] = $e.thread_name }
+  }
+  $ids = @($names.Keys | Where-Object { $names[$_] -eq $chat })
+  if ($ids.Count -eq 0) { throw "В Codex нет чата «$chat». Создайте его или переименуйте нужный чат." }
+  if ($ids.Count -gt 1) { throw "В Codex несколько чатов «$chat»: $($ids -join ', '). Оставьте одно такое имя." }
+  return $ids[0]
+}
+
 function Read-Letter([string]$path) {
   $text = [IO.File]::ReadAllText($path, $Utf8)
   $meta = @{}
@@ -127,8 +146,12 @@ function Send-Letter {
     ) -join "`n"
     # PowerShell 5.1 ломает кавычки внутри аргументов внешних программ.
     $notice = $notice -replace '"', "'"
-    $out = & $codex queue --thread $cfg.codexChat --message $notice 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Письмо $id лежит в ящике, но очередь Codex не приняла его: $out" }
+    $thread = Resolve-CodexThread $cfg.codexChat
+    $ErrorActionPreference = 'Continue'
+    $out = & $codex queue --thread $thread --message $notice 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($code -ne 0) { throw "Письмо $id лежит в ящике, но очередь Codex не приняла его: $out" }
     Move-ToArchive $final 'delivered'
     Write-Output "Отправлено: $id -> чат Codex «$($cfg.codexChat)»."
   } else {
@@ -174,7 +197,8 @@ switch ($Command) {
   'status' {
     $cfg = Get-Config
     Write-Output "Ящик:        $MailHome"
-    Write-Output "Чат Codex:   $($cfg.codexChat)"
+    $thread = try { Resolve-CodexThread $cfg.codexChat } catch { "ОШИБКА: $($_.Exception.Message)" }
+    Write-Output "Чат Codex:   $($cfg.codexChat) ($thread)"
     Write-Output "Лимит кругов: $($cfg.maxRounds)"
     $codex = Find-Codex
     Write-Output "codex.exe:   $(if ($codex) { $codex } else { 'НЕ НАЙДЕН' })"
