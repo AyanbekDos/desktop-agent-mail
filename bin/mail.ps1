@@ -63,6 +63,28 @@ function Find-Codex {
   return $null
 }
 
+# PowerShell 5.1 искажает кавычки и переносы в аргументах внешних программ,
+# поэтому собираем командную строку сами по правилам Windows и запускаем через .NET.
+function Format-NativeArg([string]$a) {
+  '"' + (($a -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+}
+
+function Invoke-Native([string]$exe, [string[]]$argv) {
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = $exe
+  $psi.Arguments = ($argv | ForEach-Object { Format-NativeArg $_ }) -join ' '
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.StandardOutputEncoding = $Utf8
+  $psi.StandardErrorEncoding = $Utf8
+  $p = [Diagnostics.Process]::Start($psi)
+  $errTask = $p.StandardError.ReadToEndAsync()
+  $out = $p.StandardOutput.ReadToEnd()
+  $p.WaitForExit()
+  return @{ Code = $p.ExitCode; Out = $out + $errTask.Result }
+}
+
 # codex queue не находит чат по имени, когда чатов много, поэтому ищем номер сами.
 # В session_index.jsonl переименование дописывает новую строку: актуально последнее имя.
 function Resolve-CodexThread([string]$chat) {
@@ -144,16 +166,12 @@ function Send-Letter {
       '---'
       "Действуй по скиллу agent-mail. Ответ: mail.ps1 send -From codex -To $From -ReplyTo $id -Round $next -Topic ""..."" -BodyFile <файл>"
     ) -join "`n"
-    # PowerShell 5.1 ломает кавычки внутри аргументов внешних программ.
-    $notice = $notice -replace '"', "'"
     $thread = Resolve-CodexThread $cfg.codexChat
-    $ErrorActionPreference = 'Continue'
-    $out = & $codex queue --thread $thread --message $notice 2>&1 | Out-String
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = 'Stop'
-    if ($code -ne 0) { throw "Письмо $id лежит в ящике, но очередь Codex не приняла его: $out" }
-    Move-ToArchive $final 'delivered'
-    Write-Output "Отправлено: $id -> чат Codex «$($cfg.codexChat)»."
+    $r = Invoke-Native $codex @('queue', '--thread', $thread, '--message', $notice)
+    if ($r.Code -ne 0) { throw "Письмо $id лежит в ящике, но очередь Codex не приняла его: $($r.Out)" }
+    # Успех queue значит «поставлено в очередь», а не «прочитано»: ответ проверяется отдельно.
+    Move-ToArchive $final 'queued'
+    Write-Output "Поставлено в очередь: $id -> чат Codex «$($cfg.codexChat)»."
   } else {
     Write-Output "Отправлено: $id -> ящик $To."
   }
